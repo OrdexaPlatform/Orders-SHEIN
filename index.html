@@ -306,10 +306,10 @@ const U = {
   debounce(fn,ms=250){ let t; return function(...a){ clearTimeout(t); t=setTimeout(()=>fn.apply(this,a),ms); }; }
 };
 
-/* ---------- DB Layer (IndexedDB) ---------- */
+/* ---------- DB Layer (IndexedDB) — defensive init ---------- */
 const DB = (() => {
   const NAME = 'SheinBusinessDB';
-  const VER = 1;
+  const VER = 2;
   const STORES = {
     customers:{keyPath:'id',indexes:['code','name','phone','status']},
     products:{keyPath:'id',indexes:['code','name','sheinCode']},
@@ -326,27 +326,73 @@ const DB = (() => {
   };
   let db=null;
 
-  function init(){
-    return new Promise((resolve,reject)=>{
-      const req = indexedDB.open(NAME,VER);
-      req.onupgradeneeded = e => {
-        const d = e.target.result;
-        for(const [name,cfg] of Object.entries(STORES)){
-          let store;
-          if(!d.objectStoreNames.contains(name)){
-            store = d.createObjectStore(name,{keyPath:cfg.keyPath});
-          } else {
-            store = e.target.transaction.objectStore(name);
-          }
-          cfg.indexes.forEach(ix=>{
-            if(!store.indexNames.contains(ix)) store.createIndex(ix,ix,{unique:false});
-          });
-        }
-      };
-      req.onsuccess = ()=>{ db=req.result; resolve(); };
-      req.onerror = ()=>reject(req.error);
+  function listHas(list,name){
+    if(!list) return false;
+    try{ if(typeof list.contains==='function') return list.contains(name); }catch(e){}
+    try{ if(typeof list.includes==='function') return list.includes(name); }catch(e){}
+    try{ for(let i=0;i<list.length;i++){ if(list[i]===name) return true; } }catch(e){}
+    return false;
+  }
+
+  function deleteDB(name){
+    return new Promise(res=>{
+      let r;
+      try{ r = indexedDB.deleteDatabase(name); }catch(e){ return res(false); }
+      r.onsuccess=()=>res(true);
+      r.onerror=()=>res(false);
+      r.onblocked=()=>res(true);
+      setTimeout(()=>res(true),1500);
     });
   }
+
+  function openOnce(){
+    return new Promise((resolve,reject)=>{
+      let req;
+      try{ req = indexedDB.open(NAME,VER); }catch(e){ return reject(e); }
+      req.onupgradeneeded = function(e){
+        try{
+          const d = e.target.result;
+          const tx = e.target.transaction;
+          Object.keys(STORES).forEach(function(name){
+            const cfg = STORES[name];
+            let store;
+            try{
+              if(!listHas(d.objectStoreNames,name)){
+                store = d.createObjectStore(name,{keyPath:cfg.keyPath});
+              } else {
+                store = tx.objectStore(name);
+              }
+            }catch(err){ console.warn('store '+name+':',err); return; }
+            (cfg.indexes||[]).forEach(function(ix){
+              try{
+                if(!listHas(store.indexNames,ix)){
+                  store.createIndex(ix,ix,{unique:false});
+                }
+              }catch(err){ console.warn('index '+name+'.'+ix+':',err); }
+            });
+          });
+        }catch(err){
+          console.error('upgradeneeded fatal:',err);
+        }
+      };
+      req.onsuccess = ()=>resolve(req.result);
+      req.onerror = ()=>reject(req.error||new Error('تعذّر فتح قاعدة البيانات'));
+      req.onblocked = ()=>{ /* ننتظر */ };
+    });
+  }
+
+  async function init(){
+    try{
+      db = await openOnce();
+    }catch(e){
+      console.warn('محاولة أولى فشلت، سيتم حذف القاعدة والمحاولة من جديد:',e);
+      try{ if(db && db.close) db.close(); }catch(_){}
+      db = null;
+      await deleteDB(NAME);
+      db = await openOnce();
+    }
+  }
+
   function reqP(r){ return new Promise((res,rej)=>{ r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); }
   function tx(stores,mode){ return db.transaction(stores,mode); }
   function get(store,key){ return reqP(tx(store).objectStore(store).get(key)); }
@@ -629,7 +675,6 @@ const Payment = {
       method:'cash',customerId:'',orderId:'',packageId:'',refId:'',notes:'',status:'confirmed',
       created_at:U.now(),...data};
     await DB.put('payments',p);
-    // allocations: allow split across orders
     if(Array.isArray(data.allocations) && data.allocations.length){
       for(const a of data.allocations){
         await DB.put('paymentAllocations',{id:U.uuid(),paymentId:p.id,orderId:a.orderId,amount:U.num(a.amount),created_at:U.now()});
@@ -658,11 +703,6 @@ const Calc = {
     const sar = billable * U.num(pkg.ratePerKg);
     return sar * U.num(pkg.exchangeRate,1);
   },
-  /**
-   * Allocate a total cost across items based on method.
-   * items: [{id, weight, qty, purchaseValueEGP, manualShare}]
-   * Returns array [{id, share}] with rounding diff added to largest.
-   */
   allocateCost(total, items, method){
     total = U.num(total);
     if(!items.length) return [];
@@ -680,20 +720,17 @@ const Calc = {
       const totalVal = items.reduce((s,i)=>s+U.num(i.purchaseValueEGP,0),0);
       if(totalVal===0){ items.forEach(i=> shares.push({id:i.id, share: total/items.length})); }
       else items.forEach(i=> shares.push({id:i.id, share: total*(U.num(i.purchaseValueEGP,0)/totalVal)}));
-    } else { // weight (default)
+    } else {
       const totalW = items.reduce((s,i)=>s+U.num(i.weight,0)*U.num(i.qty,1),0);
       if(totalW===0){
-        // fall back to equal split and mark unknown
         items.forEach(i=> shares.push({id:i.id, share: total/items.length, weightUnknown:true}));
       } else {
         items.forEach(i=> shares.push({id:i.id, share: total*((U.num(i.weight,0)*U.num(i.qty,1))/totalW)}));
       }
     }
-    // fix rounding: compute sum and adjust largest
     const sum = shares.reduce((s,x)=>s+x.share,0);
     const diff = U.round2(total - sum);
     if(Math.abs(diff) > 0.0001 && shares.length){
-      // add diff to largest share
       let maxIdx = 0;
       for(let i=1;i<shares.length;i++) if(shares[i].share>shares[maxIdx].share) maxIdx=i;
       shares[maxIdx].share = U.round2(shares[maxIdx].share + diff);
@@ -703,17 +740,7 @@ const Calc = {
 };
 
 /* ---------- Profit Engine ---------- */
-/**
- * Computes order-level and item-level financials.
- * Avoids double-counting by separating:
- *  - "expected" figures: from saved snapshots at order time
- *  - "actual" figures: from purchases / expenses / payments
- */
 const ProfitEngine = {
-  /**
-   * Compute a full snapshot for an order.
-   * Returns { items:[...], totals:{...} }
-   */
   async orderSnapshot(orderId){
     const order = await Order.get(orderId);
     if(!order) return null;
@@ -723,22 +750,11 @@ const ProfitEngine = {
     const expenses = pkg ? await Expense.byPackage(pkg.id) : [];
     const payments = await Payment.byOrder(orderId);
 
-    // Package totals
     const pkgItems = pkg ? await this._packageItems(pkg.id) : [];
-    const pkgTotalWeight = pkgItems.reduce((s,i)=>s+U.num(i.totalWeight,0),0);
-    const pkgTotalQty = pkgItems.reduce((s,i)=>s+U.num(i.qty,0),0);
-    const pkgTotalValue = pkgItems.reduce((s,i)=>s+U.num(i.totalPurchaseEGP,0),0);
-
-    // Shipping cost for package (from snapshot or calculated)
     const pkgShippingEGP = pkg ? (U.num(pkg.actualShippingCost)>0 ? U.num(pkg.actualShippingCost) : Calc.packageShippingCostEGP(pkg)) : 0;
-
-    // Total purchase cost from actual purchase invoices (if any)
     const totalPurchaseEGP_fromInvoices = purchases.reduce((s,p)=>s+U.num(p.totalEGP),0);
-
-    // Other expenses on the package (excluding shipping)
     const otherExpensesEGP = expenses.filter(e=>e.category!=='shipping').reduce((s,e)=>s+U.num(e.amountEGP,0),0);
 
-    // Allocate shipping to items by weight
     const allocMethod = pkg?.allocationMethod || 'weight';
     const shippingAlloc = pkg ? Calc.allocateCost(pkgShippingEGP, pkgItems.map(i=>({
       id:i.id,weight:U.num(i.weight),qty:U.num(i.qty,1),purchaseValueEGP:U.num(i.totalPurchaseEGP),manualShare:0
@@ -746,24 +762,20 @@ const ProfitEngine = {
     const shippingMap = {};
     shippingAlloc.forEach(a=> shippingMap[a.id]=a.share);
 
-    // Allocate other package expenses by weight (or chosen method)
     const otherAlloc = pkg ? Calc.allocateCost(otherExpensesEGP, pkgItems.map(i=>({
       id:i.id,weight:U.num(i.weight),qty:U.num(i.qty,1),purchaseValueEGP:U.num(i.totalPurchaseEGP),manualShare:0
     })), allocMethod) : [];
     const otherMap = {};
     otherAlloc.forEach(a=> otherMap[a.id]=a.share);
 
-    // Refunds
     const refunds = payments.filter(p=>p.type==='refund' && p.status==='confirmed').reduce((s,p)=>s+U.num(p.amount,0),0);
 
-    // Build item snapshots
-    let grossSales=0, netSales=0, totalCost=0, totalProfit=0;
+    let grossSales=0, totalCost=0, totalProfit=0;
     const itemSnapshots = items.map(it=>{
       const itemQty = U.num(it.qty,0);
       const salePrice = U.num(it.salePrice,0);
       const gross = salePrice*itemQty;
       const purchaseEGP = U.num(it.purchaseSAR,0)*U.num(it.exchangeRate,1)*itemQty;
-      // prefer actual from invoices if available (not implemented line-by-line here)
       const shipShare = shippingMap[it.id]||0;
       const otherShare = otherMap[it.id]||0;
       const directExtra = U.num(it.extraCostEGP,0);
@@ -780,10 +792,7 @@ const ProfitEngine = {
       };
     });
 
-    // Order-level refund adjustment (refunds reduce net sales)
-    netSales = grossSales - refunds;
-
-    // Payments summary
+    const netSales = grossSales - refunds;
     const paid = payments.filter(p=>p.status==='confirmed' && p.type!=='refund').reduce((s,p)=>s+U.num(p.amount,0),0);
     const refunded = refunds;
     const netPaid = paid - refunded;
@@ -809,9 +818,6 @@ const ProfitEngine = {
     }
     return all;
   },
-  /**
-   * Snapshot for a package
-   */
   async packageSnapshot(pkgId){
     const pkg = await Package.get(pkgId);
     if(!pkg) return null;
@@ -828,7 +834,6 @@ const ProfitEngine = {
     const shippingEGP = U.num(pkg.actualShippingCost)>0 ? U.num(pkg.actualShippingCost) : Calc.packageShippingCostEGP(pkg);
     const otherExpenses = expenses.filter(e=>e.category!=='shipping').reduce((s,e)=>s+U.num(e.amountEGP,0),0);
 
-    // payments collected on orders in this package
     let paid=0, refunded=0;
     for(const o of orders){
       const pays = await Payment.byOrder(o.id);
@@ -853,9 +858,6 @@ const ProfitEngine = {
       }
     };
   },
-  /**
-   * Customer balance computed from orders and payments.
-   */
   async customerSnapshot(customerId){
     const customer = await Customer.get(customerId);
     if(!customer) return null;
@@ -881,14 +883,12 @@ const ProfitEngine = {
   },
   async dashboard(){
     const customers = await Customer.list();
-    const products = await Product.list();
     const orders = await Order.list();
     const packages = (await Package.list());
     const payments = (await Payment.list());
     const expenses = (await Expense.list());
     const purchases = await Purchase.list();
 
-    const grossSales = orders.reduce((s,o)=>s+0,0); // computed below
     let totalSales=0, totalPaid=0, totalRefunded=0;
     let customersWithBalance = new Set();
     let ordersNotDelivered = 0;
@@ -904,33 +904,26 @@ const ProfitEngine = {
     }
     const netPaid = totalPaid - totalRefunded;
 
-    // Total purchase cost: prefer invoices, fallback to items
     let totalPurchaseEGP = purchases.reduce((s,p)=>s+U.num(p.totalEGP,0),0);
     const allItems = await OrderItem.list();
     if(totalPurchaseEGP===0){
       totalPurchaseEGP = allItems.reduce((s,i)=>s+U.num(i.totalPurchaseEGP,0),0);
     }
 
-    // Shipping total from packages (actual or calculated)
     let totalShippingEGP = 0;
     for(const p of packages){
       const actual = U.num(p.actualShippingCost,0);
       totalShippingEGP += actual>0 ? actual : Calc.packageShippingCostEGP(p);
     }
-    // other expenses (non-shipping, non-goods)
     const otherExpensesEGP = expenses.filter(e=>e.category!=='shipping' && e.category!=='goods').reduce((s,e)=>s+U.num(e.amountEGP,0),0);
 
     const totalCost = totalPurchaseEGP + totalShippingEGP + otherExpensesEGP;
     const expectedProfit = totalSales - totalCost;
-    const actualProfit = totalSales - totalCost; // in this simplified model equals expected since we use actual costs
+    const actualProfit = totalSales - totalCost;
 
-    // deposits
     const deposits = payments.filter(p=>p.type==='deposit' && p.status==='confirmed').reduce((s,p)=>s+U.num(p.amount,0),0);
-
-    // open packages
     const openPkgs = packages.filter(p=>p.status!=='completed' && p.status!=='cancelled').length;
 
-    // recent payments
     const recentPayments = [...payments].sort((a,b)=> (b.datetime||'').localeCompare(a.datetime||'')).slice(0,6);
     const recentOrders = [...orders].sort((a,b)=> (b.created_at||'').localeCompare(a.created_at||'')).slice(0,6);
 
@@ -1006,7 +999,7 @@ const UI = (()=>{
 
   function confirmDialog(msg,{title='تأكيد',okText='تأكيد',danger=true}={}){
     return new Promise(resolve=>{
-      const body = el('div',{},[ el('p',{text:msg,style:'margin:0;font-size:14.5px;line-height:1.7'}) ]);
+      const body = el('div',{},[ el('p',{text:msg,style:'margin:0;font-size:14.5px;line-height:1.7;white-space:pre-wrap'}) ]);
       const foot = el('div',{class:'btn-row'});
       const cancelBtn = el('button',{class:'btn',text:'إلغاء',onclick:()=>{ m.close(); resolve(false); }});
       const okBtn = el('button',{class:'btn '+(danger?'danger':'primary'),text:okText,onclick:()=>{ m.close(); resolve(true); }});
@@ -1015,10 +1008,6 @@ const UI = (()=>{
     });
   }
 
-  /**
-   * Build a form modal from fields spec.
-   * fields: [{name,label,type,required,value,options,placeholder,hint,col}]
-   */
   function formModal({title,fields,onSubmit,submitText='حفظ',initial}){
     const body = el('div',{class:'form-grid'});
     const inputs = {};
@@ -1073,7 +1062,6 @@ const UI = (()=>{
           else if(f.type==='number') data[f.name] = U.num(i.value,0);
           else data[f.name] = i.value.trim ? i.value.trim() : i.value;
         });
-        // HTML5 validation
         for(const f of fields){
           if(f.required){
             const v = data[f.name];
@@ -1116,7 +1104,6 @@ const Router = {
       orders:'الطلبات',orderDetail:'تفاصيل الطلب',packages:'الباكينجات',packageDetail:'تفاصيل الباكينج',
       purchases:'المشتريات',expenses:'المصاريف',payments:'المدفوعات',reports:'التقارير',settings:'الإعدادات'};
     document.getElementById('pageTitle').textContent = titles[view]||view;
-    // close mobile sidebar
     document.getElementById('sidebar').classList.remove('open');
     const v = Views[view];
     if(!v){ UI.viewEl.innerHTML = '<div class="empty">الشاشة غير موجودة</div>'; return; }
@@ -1163,7 +1150,6 @@ Views.dashboard = async ()=>{
   const k = data.kpis;
   const root = document.createElement('div');
 
-  // KPI cards
   const kpiGrid = UI.el('div',{class:'grid grid-4'},[
     kpi('إجمالي المبيعات (صافي)', U.fmtEGP(k.totalSales), null, 'blue'),
     kpi('صافي الربح المتوقع', U.fmtEGP(k.expectedProfit), null, k.expectedProfit>=0?'green':'red'),
@@ -1180,7 +1166,6 @@ Views.dashboard = async ()=>{
   ]);
   root.appendChild(pageSection('المؤشرات الرئيسية',null,kpiGrid));
 
-  // Recent payments & orders
   const recentGrid = UI.el('div',{class:'grid grid-2'});
 
   const payCard = UI.el('div',{class:'card'},[UI.el('div',{class:'card-title',text:'آخر العمليات المالية'})]);
@@ -1223,7 +1208,6 @@ Views.dashboard = async ()=>{
   recentGrid.appendChild(ordCard);
   root.appendChild(pageSection('النشاط الأخير',null,recentGrid));
 
-  // Monthly chart (simple)
   const monthsMap = {};
   data.payments.forEach(p=>{
     if(p.status!=='confirmed' || p.type==='refund') return;
@@ -1378,7 +1362,6 @@ Views.customerDetail = async ({id})=>{
   }
   root.appendChild(pageSection('الطلبات',null,ordCard));
 
-  // payments
   const pays = await Payment.byCustomer(customer.id);
   const payCard = UI.el('div',{class:'card'},[UI.el('div',{class:'card-title',text:'سجل الدفعات ('+pays.length+')'})]);
   if(pays.length===0) payCard.appendChild(emptyState('لا توجد دفعات','💰'));
@@ -1637,7 +1620,6 @@ Views.orderDetail = async ({id})=>{
   ]);
   root.appendChild(head);
 
-  // Status + package selector
   const statusRow = UI.el('div',{class:'card',style:'display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:14px'});
   statusRow.appendChild(UI.el('span',{class:'badge '+colorOf('orderStatus',order.status),text:labelOf('orderStatus',order.status)}));
   const statusSel = UI.el('select',{class:'input',style:'max-width:220px'});
@@ -1657,7 +1639,6 @@ Views.orderDetail = async ({id})=>{
   statusRow.appendChild(pkgSel);
   root.appendChild(statusRow);
 
-  // KPIs
   if(snap){
     const kpis = UI.el('div',{class:'grid grid-4'},[
       kpi('صافي المبيعات', U.fmtEGP(snap.totals.netSales), null,'blue'),
@@ -1668,7 +1649,6 @@ Views.orderDetail = async ({id})=>{
     root.appendChild(kpis);
   }
 
-  // Items
   const itemsCard = UI.el('div',{class:'card'});
   const itemsHead = UI.el('div',{class:'card-title'},[
     document.createTextNode('بنود الطلب ('+items.length+')'),
@@ -1710,7 +1690,6 @@ Views.orderDetail = async ({id})=>{
   }
   root.appendChild(pageSection('بنود الطلب',null,itemsCard));
 
-  // History
   const histCard = UI.el('div',{class:'card'},[UI.el('div',{class:'card-title',text:'سجل الحالة'})]);
   const hist = order.history||[];
   if(hist.length===0) histCard.appendChild(emptyState('لا يوجد سجل','🕓'));
@@ -1745,7 +1724,6 @@ Views.orderDetail = async ({id})=>{
         {name:'extraCostEGP',label:'تكاليف إضافية مباشرة (ج.م)',type:'number',value:existing?existing.extraCostEGP:0}
       ],
       onSubmit: async (data)=>{
-        // Auto-fill from product
         if(data.productId){
           const p = await Product.get(data.productId);
           if(p){
@@ -1937,7 +1915,6 @@ Views.packageDetail = async ({id})=>{
   ]);
   root.appendChild(pageSection('ملخص الباكينج',null,kpis));
 
-  // Orders in package
   const ordCard = UI.el('div',{class:'card'},[UI.el('div',{class:'card-title'},[
     document.createTextNode('الطلبات المرتبطة ('+orders.length+')'),
     UI.el('button',{class:'btn sm',text:'+ إضافة طلب',onclick:()=>addOrderToPkg(pkg.id)})
@@ -1964,7 +1941,6 @@ Views.packageDetail = async ({id})=>{
   }
   root.appendChild(pageSection('الطلبات',null,ordCard));
 
-  // Purchases
   const purchases = await Purchase.byPackage(pkg.id);
   const purCard = UI.el('div',{class:'card'},[UI.el('div',{class:'card-title',text:'فواتير الشراء ('+purchases.length+')'})]);
   if(purchases.length===0) purCard.appendChild(emptyState('لا توجد فواتير','🧾'));
@@ -1987,7 +1963,6 @@ Views.packageDetail = async ({id})=>{
   }
   root.appendChild(pageSection('المشتريات',null,purCard));
 
-  // Expenses
   const expenses = await Expense.byPackage(pkg.id);
   const expCard = UI.el('div',{class:'card'},[UI.el('div',{class:'card-title',text:'المصاريف ('+expenses.length+')'})]);
   if(expenses.length===0) expCard.appendChild(emptyState('لا توجد مصاريف','💸'));
@@ -2145,7 +2120,6 @@ Views.purchases = async ()=>{
 Views.expenses = async ()=>{
   const [list, packages, customers] = await Promise.all([Expense.list(), Package.list(), Customer.list()]);
   const pkgMap = Object.fromEntries(packages.map(p=>[p.id,p]));
-  const custMap = Object.fromEntries(customers.map(c=>[c.id,c]));
   const root = document.createElement('div');
   root.appendChild(toolbar([
     (()=>{ return UI.el('div',{class:'spacer'}); })(),
@@ -2279,7 +2253,6 @@ Views.reports = async ()=>{
     Package.list(), Order.list(), Customer.list(), Payment.list(), Expense.list()
   ]);
 
-  // Package profits
   const pkgCard = UI.el('div',{class:'card'},[UI.el('div',{class:'card-title',text:'ربح الباكينجات'})]);
   if(packages.length===0) pkgCard.appendChild(emptyState('لا توجد باكينجات','📊'));
   else {
@@ -2303,7 +2276,6 @@ Views.reports = async ()=>{
   }
   root.appendChild(pageSection('ربحية الباكينجات',null,pkgCard));
 
-  // Customer debts
   const debtCard = UI.el('div',{class:'card'},[UI.el('div',{class:'card-title',text:'العملاء الذين لديهم مستحقات'})]);
   const rows = [];
   for(const c of customers){
@@ -2331,7 +2303,6 @@ Views.reports = async ()=>{
   }
   root.appendChild(pageSection('المستحقات',null,debtCard));
 
-  // Expenses by category
   const catMap = {};
   expenses.forEach(e=>{ catMap[e.category] = (catMap[e.category]||0) + U.num(e.amountEGP,0); });
   const catCard = UI.el('div',{class:'card'},[UI.el('div',{class:'card-title',text:'المصاريف حسب الفئة'})]);
@@ -2401,7 +2372,6 @@ Views.settings = async ()=>{
   ]);
   root.appendChild(pageSection('الإعدادات',null,general));
 
-  // Backup card
   const backup = UI.el('div',{class:'card'},[
     UI.el('div',{class:'card-title',text:'النسخ الاحتياطي والاستيراد'}),
     UI.el('p',{style:'color:var(--muted);font-size:13px;margin:0 0 12px'},[
@@ -2420,7 +2390,6 @@ Views.settings = async ()=>{
   ]);
   root.appendChild(pageSection('النسخ الاحتياطي',null,backup));
 
-  // Danger zone
   const danger = UI.el('div',{class:'card',style:'border-color:#fecaca'},[
     UI.el('div',{class:'card-title',text:'منطقة الخطر'}),
     UI.el('p',{style:'color:var(--muted);font-size:13px;margin:0 0 12px',text:'مسح جميع البيانات لا يمكن التراجع عنه.'}),
@@ -2474,7 +2443,6 @@ function importBackup(){
         {okText:'استبدال',danger:true}
       );
       if(!ok) return;
-      // clear and restore
       await DB.clearMany(Object.keys(DB.STORES));
       for(const name of Object.keys(DB.STORES)){
         const arr = data.data[name]||[];
@@ -2511,7 +2479,6 @@ async function exportCSV(type){
     if(v.includes(',')||v.includes('"')||v.includes('\n')) v = '"'+v+'"';
     return v;
   }).join(','))).join('\n');
-  // BOM for Excel Arabic support
   const blob = new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'});
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -2539,11 +2506,20 @@ function toggleTheme(){
 const App = {
   async init(){
     initTheme();
-    try{ await DB.init(); } catch(e){ alert('فشل فتح قاعدة البيانات: '+e.message); return; }
+    try{ await DB.init(); }
+    catch(e){
+      console.error(e);
+      document.getElementById('view').innerHTML =
+        '<div class="card" style="border-color:#fecaca;background:#fef2f2;color:#991b1b;margin:20px">' +
+        '<h3 style="margin:0 0 8px">تعذّر فتح قاعدة البيانات</h3>' +
+        '<p style="margin:0 0 8px">'+U.esc(e.message||'خطأ غير معروف')+'</p>' +
+        '<p style="margin:0;font-size:13px">افتح إعدادات المتصفح ← مسح بيانات التصفح ← امسح "ملفات تعريف الارتباط وبيانات الموقع" للموقع ده، ثم أعد التحميل.</p>' +
+        '</div>';
+      return;
+    }
     await Settings.load();
     document.getElementById('brandName').textContent = Settings.get('brandName');
 
-    // Nav clicks
     document.querySelectorAll('.nav-item, .bn-item').forEach(n=>{
       n.addEventListener('click',()=>Router.go(n.dataset.view));
     });
@@ -2551,7 +2527,6 @@ const App = {
       document.getElementById('sidebar').classList.toggle('open');
     };
     document.getElementById('themeBtn').onclick = toggleTheme;
-    // Close sidebar when clicking outside on mobile
     document.addEventListener('click',(e)=>{
       const sb = document.getElementById('sidebar');
       if(window.innerWidth<=900 && sb.classList.contains('open')){
